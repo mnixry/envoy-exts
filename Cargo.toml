@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[profile.release]
+lto = true
+opt-level = "z"
+panic = "abort"
+codegen-units = 1
+strip = "debuginfo"
