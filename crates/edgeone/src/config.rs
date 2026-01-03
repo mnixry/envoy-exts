@@ -1,5 +1,4 @@
 use anyhow::{Context as _, Result};
-use regex::Regex;
 use serde::Deserialize;
 use std::{env::VarError, time::Duration};
 
@@ -87,23 +86,180 @@ pub(crate) fn load_config<R: AsRef<[u8]>>(raw: R) -> Result<(ConfigRuntime, usiz
 }
 
 fn expand_env(s: &str, mapping: impl Fn(&str) -> Result<String>) -> Result<String> {
-    let re = Regex::new(r"\$(?P<name>\{\w+\}|\w+)")?;
-    let mut buf = String::new();
-    let mut i = 0;
-    for caps in re.captures_iter(s) {
-        buf.push_str(&s[i..caps.get_match().start()]);
-        if let Some(name) = caps.name("name").map(|m| m.as_str()) {
-            if name.starts_with('{') && name.ends_with('}') {
-                let name = &name[1..name.len() - 1];
-                let value = mapping(name).context("failed to map variable")?;
-                buf.push_str(&value);
-            } else {
-                let value = mapping(name).context("failed to map variable")?;
-                buf.push_str(&value);
+    // Mirrors Go's os.Expand/os.ExpandEnv parsing semantics.
+    // See: $GOROOT/src/os/env.go (Expand, getShellName).
+    let bytes = s.as_bytes();
+    let mut buf: Option<Vec<u8>> = None;
+
+    // ${} is all ASCII, so bytes are fine for this operation.
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while j < bytes.len() {
+        if bytes[j] == b'$' && j + 1 < bytes.len() {
+            if buf.is_none() {
+                buf = Some(Vec::with_capacity(2 * bytes.len()));
             }
+            let out = buf.as_mut().expect("buf is always Some here");
+            out.extend_from_slice(&bytes[i..j]);
+
+            let (name_bytes, w) = get_shell_name(&bytes[j + 1..]);
+            if name_bytes.is_empty() && w > 0 {
+                // Encountered invalid syntax; eat the characters.
+            } else if name_bytes.is_empty() {
+                // Valid syntax, but $ was not followed by a name. Leave the dollar untouched.
+                out.push(b'$');
+            } else {
+                // `name_bytes` is a slice of the original UTF-8 string, so it's valid UTF-8.
+                let name = std::str::from_utf8(name_bytes)
+                    .expect("env var name bytes are always valid UTF-8");
+                let value = mapping(name)?;
+                out.extend_from_slice(value.as_bytes());
+            }
+
+            j = j + 1 + w;
+            i = j;
+            continue;
         }
-        i = caps.get_match().end();
+        j += 1;
     }
-    buf.push_str(&s[i..]);
-    Ok(buf)
+
+    match buf {
+        None => Ok(s.to_string()),
+        Some(mut out) => {
+            out.extend_from_slice(&bytes[i..]);
+            Ok(String::from_utf8(out).expect("output is valid UTF-8"))
+        }
+    }
+}
+
+fn is_shell_special_var(c: u8) -> bool {
+    matches!(
+        c,
+        b'*' | b'#'
+            | b'$'
+            | b'@'
+            | b'!'
+            | b'?'
+            | b'-'
+            | b'0'
+            | b'1'
+            | b'2'
+            | b'3'
+            | b'4'
+            | b'5'
+            | b'6'
+            | b'7'
+            | b'8'
+            | b'9'
+    )
+}
+
+fn is_alpha_num(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphanumeric()
+}
+
+fn get_shell_name(s: &[u8]) -> (&[u8], usize) {
+    match () {
+        _ if s[0] == b'{' => {
+            if s.len() > 2 && is_shell_special_var(s[1]) && s[2] == b'}' {
+                return (&s[1..2], 3);
+            }
+            // Scan to closing brace
+            for i in 1..s.len() {
+                if s[i] == b'}' {
+                    if i == 1 {
+                        return (&[], 2); // Bad syntax; eat "${}"
+                    }
+                    return (&s[1..i], i + 1);
+                }
+            }
+            (&[], 1) // Bad syntax; eat "${"
+        }
+        _ if is_shell_special_var(s[0]) => (&s[0..1], 1),
+        _ => {
+            // Scan alphanumerics.
+            let mut i = 0usize;
+            while i < s.len() && is_alpha_num(s[i]) {
+                i += 1;
+            }
+            (&s[..i], i)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_env;
+    use anyhow::Result;
+
+    fn mapper(name: &str) -> Result<String> {
+        Ok(match name {
+            "FOO" => "foo",
+            "FOO_BAR" => "foo_bar",
+            "X" => "x",
+            "_" => "underscore",
+            _ => "",
+        }
+        .to_string())
+    }
+
+    #[test]
+    fn expand_env_matches_go_os_expandenv_examples() -> Result<()> {
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("no vars", "no vars"),
+            ("$", "$"),
+            ("$$", ""),
+            ("$$$", "$"),
+            ("$$FOO", "FOO"),
+            ("$FOO", "foo"),
+            ("${FOO}", "foo"),
+            ("${FOO_BAR}", "foo_bar"),
+            ("$FOO_BAR", "foo_bar"),
+            ("$FOO-BAR", "foo-BAR"),
+            ("${FOO-BAR}", ""),
+            ("${FOO", "FOO"),
+            ("${}", ""),
+            ("$1", ""),
+            ("$9abc", "abc"),
+            ("$FOO1", ""),
+            ("${FOO}1", "foo1"),
+            ("a$FOOb", "a"),
+            ("a${FOO}b", "afoob"),
+            ("a$FOO_barb", "a"),
+            ("a$FOO_BARb", "a"),
+            ("a$_b", "a"),
+            ("a${_}b", "aunderscoreb"),
+            ("${X}${X}", "xx"),
+            ("$X$X", "xx"),
+            ("${X}$X", "xx"),
+            ("${X}${}", "x"),
+            ("${X}${X", "xX"),
+            ("$-", ""),
+            ("$*", ""),
+            ("${-}", ""),
+            ("${*}", ""),
+            ("${1}", ""),
+            ("${9abc}", ""),
+            ("${FOO}$$${FOO}", "foofoo"),
+            ("prefix ${FOO} suffix", "prefix foo suffix"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(expand_env(input, mapper)?, *expected, "input={input:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expand_env_propagates_mapping_errors() {
+        let err_mapper = |name: &str| -> Result<String> {
+            if name == "FOO" {
+                anyhow::bail!("boom");
+            }
+            Ok(String::new())
+        };
+        let err = expand_env("$FOO", err_mapper).unwrap_err();
+        assert!(err.to_string().contains("boom"));
+    }
 }
