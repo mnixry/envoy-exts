@@ -13,11 +13,12 @@ mod config;
 mod tencent_api;
 
 proxy_wasm::main! {{
-    proxy_wasm::set_log_level(LogLevel::Info);
+    proxy_wasm::set_log_level(LogLevel::Trace);
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> { Box::new(EdgeOneRoot::default()) });
 }}
 
 const HEADER_TRUSTED: &str = "x-forwarded-from-edgeone";
+const HEADER_RESPONSE_TRUSTED: &str = "x-intercepted-by";
 const HEADER_DOWNSTREAM_IP: &str = "eo-connecting-ip";
 const HEADER_XFF: &str = "x-forwarded-for";
 const HEADER_X_REAL_IP: &str = "x-real-ip";
@@ -235,6 +236,8 @@ impl Context for EdgeOneHttp {
 impl HttpContext for EdgeOneHttp {
     fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
         let config = { self.shared.borrow().config.clone() };
+
+        self.set_http_response_header(HEADER_RESPONSE_TRUSTED, Some("edgeone"));
         let Some(config) = config else {
             self.set_http_request_header(HEADER_TRUSTED, Some("no"));
             return Action::Continue;
