@@ -2,6 +2,7 @@
     "rust-analyzer.check.command": "clippy",
     "editor.formatOnSave": true,
     "cSpell.words": [
-        "edgeone"
+        "edgeone",
+        "hmac"
     ]
 }
