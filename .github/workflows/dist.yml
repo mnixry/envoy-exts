@@ -19,6 +19,7 @@ jobs:
       - name: Build
         run: nix build
       - uses: s0/git-publish-subdir-action@develop
+        continue-on-error: true
         env:
           REPO: self
           BRANCH: dist
